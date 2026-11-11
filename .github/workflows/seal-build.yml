@@ -1,0 +1,242 @@
+# Seal build: Spring Framework 6.0.x has no GitHub Actions build/test workflow
+# (upstream CI is Concourse, ci/scripts/build-project.sh). This replays that
+# script's Gradle command on the fork and uploads the spring-webflux jar.
+name: Seal build
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector (e.g. :spring-webflux:test --tests FooTests); empty runs the full suite'
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build and test (Linux, Liberica 17.0.7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'liberica'
+          java-version: '17.0.7'
+      - name: Enable test result logging
+        shell: bash
+        run: |
+          mkdir -p $HOME/.gradle/init.d
+          cat > $HOME/.gradle/init.d/seal-test-results.gradle <<'GRADLE'
+          allprojects {
+            // Javadoc is docs-only (not in the shipped jar); it hard-fails because the
+            // external link https://javadoc.io/static/io.rsocket/rsocket-core/1.1.1/package-list now 404s.
+            tasks.withType(Javadoc).configureEach { enabled = false }
+            tasks.withType(Test).configureEach { t ->
+              t.outputs.cacheIf { false }
+              t.outputs.upToDateWhen { false }
+              t.testLogging {
+                events 'skipped', 'failed'
+                exceptionFormat 'full'
+              }
+              def sealSkipFile = new File(t.project.rootDir, "build/seal-skipped/${t.path.replace(':', '_')}.tsv")
+              t.doFirst { sealSkipFile.delete() }
+              t.afterTest { desc, result ->
+                if (result.resultType.name() == 'SKIPPED') {
+                  sealSkipFile.parentFile.mkdirs()
+                  def msg = (result.exception?.message ?: '').replaceAll('[\\t\\r\\n]+', ' ')
+                  sealSkipFile << "${t.path}\t${desc.className}\t${desc.name}\t${msg}\t${desc.parent?.name ?: ''}\n"
+                }
+              }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+                }
+              }
+            }
+          }
+          GRADLE
+      - name: Build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --no-build-cache --no-scan --console=plain -PdeploymentRepository=$(pwd)/distribution-repository assemble publishAllPublicationsToDeploymentRepository ${{ inputs.test-filter }}
+          else
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --no-build-cache --no-scan --console=plain --continue -PdeploymentRepository=$(pwd)/distribution-repository build publishAllPublicationsToDeploymentRepository
+          fi
+      - name: Report test results
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict
+          tot = defaultdict(lambda: [0, 0, 0, 0])
+          passed = defaultdict(set)
+          for x in glob.glob('**/build/test-results/*/*.xml', recursive=True):
+              try:
+                  r = ET.parse(x).getroot()
+              except ET.ParseError:
+                  continue
+              mod = x.split(os.sep + 'build' + os.sep)[0]
+              for tc in r.iter('testcase'):
+                  if not list(tc):
+                      passed[(tc.get('classname', ''), tc.get('name', ''))].add(':' + mod.replace(os.sep, ':') + ':' + x.split(os.sep)[-2])
+              t = tot[mod]
+              t[0] += int(r.get('tests', 0)); t[1] += int(r.get('failures', 0)); t[2] += int(r.get('errors', 0)); t[3] += int(r.get('skipped', 0))
+          for mod, (n, f, e, s) in sorted(tot.items()):
+              print(f'TEST RESULTS {mod}: tests={n} passed={n - f - e - s} failed={f} errors={e} skipped={s}')
+          print(f'TEST RESULTS TOTAL: tests={sum(v[0] for v in tot.values())} passed={sum(v[0]-v[1]-v[2]-v[3] for v in tot.values())} failed={sum(v[1] for v in tot.values())} errors={sum(v[2] for v in tot.values())} skipped={sum(v[3] for v in tot.values())}')
+          idx = {}
+          for f in glob.glob('**/src/*/*/**/*.java', recursive=True) + glob.glob('**/src/*/*/**/*.kt', recursive=True):
+              parts = f.split(os.sep)
+              i = parts.index('src')
+              if len(parts) > i + 3 and parts[i + 2] in ('java', 'kotlin'):
+                  idx.setdefault('.'.join(parts[i + 3:]).rsplit('.', 1)[0], []).append(f)
+          ANN = re.compile(r'@(Disabled|Enabled|Ignore|IfProfileValue)\w*')
+          ASSUME = re.compile(r'\b(assume\w*|Assumptions\.\w+|Assume\.\w+)\s*\(')
+          cache = {}
+          def lines(f):
+              if f not in cache:
+                  with open(f, encoding='utf-8', errors='replace') as h:
+                      cache[f] = h.read().splitlines()
+              return cache[f]
+          def anns_before(ls, i):
+              out = []
+              for j in range(i, max(-1, i - 9), -1):
+                  s = ls[j].strip()
+                  if j < i and (s.endswith('}') or s.endswith(';')):
+                      break
+                  m = ANN.search(s)
+                  if m:
+                      out.append(s[m.start():])
+              return out
+          def body_assumes(ls, i):
+              out, depth, started = [], 0, False
+              for k in range(i, min(len(ls), i + 80)):
+                  l = ls[k]
+                  if ASSUME.search(l):
+                      stmt = l.strip()
+                      n = k
+                      while not stmt.endswith(';') and n + 1 < len(ls) and n < k + 3:
+                          n += 1
+                          stmt += ' ' + ls[n].strip()
+                      out.append('assumption: ' + stmt)
+                  depth += l.count('{') - l.count('}')
+                  started = started or '{' in l
+                  if started and depth <= 0:
+                      break
+              return out
+          def chain(cls):
+              top = cls.split('$')[0]
+              seen = []
+              while top in idx and top not in seen and len(seen) < 6:
+                  seen.append(top)
+                  ls = lines(idx[top][0])
+                  name = top.split('.')[-1]
+                  sup = None
+                  for l in ls:
+                      m = re.search(r'\bclass\s+' + re.escape(name) + r'\b[^{]*?\bextends\s+([\w.]+)', l)
+                      if m:
+                          sup = m.group(1)
+                          break
+                      m = re.search(r'\bclass\s+' + re.escape(name) + r'\b.*\)\s*:\s*([\w.]+)\(', l)
+                      if m:
+                          sup = m.group(1)
+                          break
+                  if not sup:
+                      break
+                  if '.' not in sup:
+                      imp = [l for l in ls if re.match(r'\s*import\s+[\w.]+\.' + re.escape(sup) + r'\s*;?\s*$', l)]
+                      sup = re.sub(r'^\s*import\s+|\s*;?\s*$', '', imp[0]) if imp else top.rsplit('.', 1)[0] + '.' + sup
+                  top = sup
+              return seen
+          def lifecycle_assumes(ls):
+              out = []
+              for i, l in enumerate(ls):
+                  if re.search(r'@(BeforeAll|BeforeEach|BeforeClass|Before)\b', l):
+                      out += [a.replace('assumption:', 'assumption in @' + re.search(r'@(\w+)', l).group(1) + ':') for a in body_assumes(ls, i + 1)]
+              return out
+          def reason(cls, name, msg, parent, task=''):
+              elsewhere = sorted(t for t in passed.get((cls, name), ()) if t != task)
+              pre = ['same test ran and PASSED in ' + ', '.join(elsewhere)] if elsewhere else []
+              if cls in ('UnknownClass', '') or not cls:
+                  cls, name = name, ''
+              method = re.sub(r'[(\[].*$', '', name).strip()
+              if (not method or method.startswith('[')) and parent:
+                  method = re.sub(r'[(\[].*$', '', parent).strip()
+              classes = chain(cls)
+              why = [msg] if msg else []
+              if method:
+                  pat = re.compile(r'\b(void|fun)\s+`?' + re.escape(method) + r'\s*`?\s*\(')
+                  for c in classes:
+                      ls = lines(idx[c][0])
+                      hits = [i for i, l in enumerate(ls) if pat.search(l)]
+                      am = re.search(r'\(([^)]*)\)', name) or re.search(r'\(([^)]*)\)', parent or '')
+                      if am and len(hits) > 1:
+                          ar = len([p for p in am.group(1).split(',') if p.strip()])
+                          def decl_arity(i):
+                              d = ls[i][ls[i].index('(') + 1:]
+                              d = d.split(')')[0]
+                              return len([p for p in d.split(',') if p.strip()])
+                          hits = [i for i in hits if decl_arity(i) == ar] or hits
+                      if hits:
+                          why += anns_before(ls, hits[0]) + body_assumes(ls, hits[0])
+                          break
+              nested = cls.split('$')[1:]
+              for c in classes:
+                  ls = lines(idx[c][0])
+                  for n in [c.split('.')[-1]] + (nested if c == classes[0] else []):
+                      for i, l in enumerate(ls):
+                          if re.search(r'\b(class|interface)\s+' + re.escape(n) + r'\b', l):
+                              why += ['class-level ' + a + ' (on ' + n + ')' for a in anns_before(ls, i)]
+                              break
+                  why += lifecycle_assumes(ls)
+              why = pre + why
+              return '; '.join(dict.fromkeys(why)) or 'no source annotation located (skipped by an upstream JUnit execution condition at runtime; no test filter applied by this build)'
+          counts = Counter()
+          tsv_rows = defaultdict(list)
+          for tsv in sorted(glob.glob('build/seal-skipped/*.tsv')):
+              with open(tsv, encoding='utf-8') as h:
+                  for row in h:
+                      task, cls, name, msg, parent = (row.rstrip('\n').split('\t') + ['', '', '', '', ''])[:5]
+                      tsv_rows[(task, cls)].append(name)
+                      counts[task] += 1
+                      print(f'SKIPPED TEST {task} {cls} > {name} reason: {reason(cls, name, msg, parent, task)}')
+          for x in sorted(glob.glob('**/build/test-results/*/*.xml', recursive=True)):
+              try:
+                  r = ET.parse(x).getroot()
+              except ET.ParseError:
+                  continue
+              mod = '' if x.startswith('build' + os.sep) else x.split(os.sep + 'build' + os.sep)[0]
+              task = (':' + mod.replace(os.sep, ':') if mod else '') + ':' + x.split(os.sep)[-2]
+              per_cls = defaultdict(list)
+              for tc in r.iter('testcase'):
+                  sk = tc.find('skipped')
+                  if sk is not None:
+                      per_cls[tc.get('classname', '')].append((tc.get('name', ''), (sk.get('message') or '').replace('\n', ' ').strip()))
+              for cls, items in per_cls.items():
+                  have = tsv_rows.get((task, cls), [])
+                  extra = len(items) - len(have)
+                  if extra <= 0:
+                      continue
+                  cand = [it for it in items if it[0] not in have] or items
+                  cand = sorted(cand, key=lambda it: it[0].startswith('['))
+                  for name, msg in cand[:extra]:
+                      counts[task] += 1
+                      print(f'SKIPPED TEST {task} {cls} > {name} reason: {reason(cls, name, msg, "", task)}')
+          for task, c in sorted(counts.items()):
+              print(f'SKIPPED TESTS LISTED FOR {task}: {c}')
+          print(f'SKIPPED TESTS WITH REASONS: {sum(counts.values())}')
+          PY
+      - name: Upload spring-webflux jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-webflux-jar
+          path: |
+            distribution-repository/org/springframework/spring-webflux/*/spring-webflux-*.jar
+            !distribution-repository/**/*-sources.jar
+            !distribution-repository/**/*-javadoc.jar
+            !distribution-repository/**/*-test-fixtures.jar
+          if-no-files-found: error
