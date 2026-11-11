@@ -18,17 +18,25 @@ package org.springframework.web.reactive.function.server;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Collections;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.testfixture.http.server.reactive.MockServerHttpRequest;
 import org.springframework.web.testfixture.server.MockServerWebExchange;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.mock;
 
 /**
  * @author Arjen Poutsma
@@ -91,6 +99,53 @@ public class PathResourceLookupFunctionTests {
 		ServerRequest request = new DefaultServerRequest(MockServerWebExchange.from(mockRequest), Collections.emptyList());
 		Mono<Resource> result = function.apply(request);
 		StepVerifier.create(result)
+				.expectComplete()
+				.verify();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"%252E%252E/testsecret/secret.txt",
+			"%252e%252e%252ftestsecret%252fsecret.txt",
+			"..%252F..%252Ftestsecret/secret.txt",
+			"%2E%2E%252F%2E%2E%252Ftestsecret/secret.txt",
+			"child/%252E%252E/%252E%252E/testsecret/secret.txt"
+	})
+	public void doubleEncodedPathTraversalIsRejected(String path) throws Exception {
+		// Use mock location: i.e. we're only testing upfront validations...
+		Resource location = mock();
+		given(location.createRelative(any())).willThrow(new AssertionError("Resource should not be resolved"));
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		MockServerHttpRequest mockRequest = MockServerHttpRequest.method(
+				HttpMethod.GET, URI.create("https://localhost/resources/" + path)).build();
+		ServerRequest request = new DefaultServerRequest(MockServerWebExchange.from(mockRequest), Collections.emptyList());
+		Mono<Resource> result = function.apply(request);
+		StepVerifier.create(result)
+				.expectComplete()
+				.verify();
+	}
+
+	@Test
+	public void doubleEncodedPathIsNormalizedWithinLocation() throws Exception {
+		ClassPathResource location = new ClassPathResource("org/springframework/web/reactive/function/server/");
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		MockServerHttpRequest mockRequest = MockServerHttpRequest.method(
+				HttpMethod.GET, URI.create("https://localhost/resources/child/%252E%252E/response.txt")).build();
+		ServerRequest request = new DefaultServerRequest(MockServerWebExchange.from(mockRequest), Collections.emptyList());
+		Mono<Resource> result = function.apply(request);
+
+		File expected = new ClassPathResource("response.txt", getClass()).getFile();
+		StepVerifier.create(result)
+				.expectNextMatches(resource -> {
+					try {
+						return expected.equals(resource.getFile());
+					}
+					catch (IOException ex) {
+						return false;
+					}
+				})
 				.expectComplete()
 				.verify();
 	}

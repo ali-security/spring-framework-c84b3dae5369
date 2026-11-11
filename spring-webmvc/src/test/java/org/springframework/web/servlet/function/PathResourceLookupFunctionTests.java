@@ -22,12 +22,17 @@ import java.util.Optional;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
 import org.springframework.web.servlet.handler.PathPatternsTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.mock;
 
 /**
  * @author Arjen Poutsma
@@ -68,6 +73,39 @@ class PathResourceLookupFunctionTests {
 
 		Optional<Resource> result = function.apply(request);
 		assertThat(result).isNotPresent();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"%252E%252E/testsecret/secret.txt",
+			"%252e%252e%252ftestsecret%252fsecret.txt",
+			"..%252F..%252Ftestsecret/secret.txt",
+			"%2E%2E%252F%2E%2E%252Ftestsecret/secret.txt",
+			"child/%252E%252E/%252E%252E/testsecret/secret.txt"
+	})
+	void doubleEncodedPathTraversalIsRejected(String path) throws Exception {
+		// Use mock location: i.e. we're only testing upfront validations...
+		Resource location = mock();
+		given(location.createRelative(any())).willThrow(new AssertionError("Resource should not be resolved"));
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		ServerRequest request = initRequest("GET", "/resources/" + path);
+
+		Optional<Resource> result = function.apply(request);
+		assertThat(result).isNotPresent();
+	}
+
+	@Test
+	void doubleEncodedPathIsNormalizedWithinLocation() throws Exception {
+		ClassPathResource location = new ClassPathResource("org/springframework/web/servlet/function/");
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		ServerRequest request = initRequest("GET", "/resources/child/%252E%252E/response.txt");
+
+		Optional<Resource> result = function.apply(request);
+		assertThat(result).isPresent();
+
+		File expected = new ClassPathResource("response.txt", getClass()).getFile();
+		assertThat(result.get().getFile()).isEqualTo(expected);
 	}
 
 	@Test

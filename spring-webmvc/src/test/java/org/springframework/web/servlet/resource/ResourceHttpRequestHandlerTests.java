@@ -365,7 +365,14 @@ class ResourceHttpRequestHandlerTests {
 		testInvalidPath("/../.." + secretPath, handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
-		testInvalidPath("%2F%2F%2E%2E%2F%2F%2E%2E" + secretPath, handler);
+
+		// double encoded
+		testInvalidPath("/%252E%252E/testsecret/secret.txt", handler);
+		testInvalidPath("%252e%252e/testsecret/secret.txt", handler);
+		testInvalidPath("%252E%252E%252Ftestsecret%252Fsecret.txt", handler);
+		testInvalidPath("..%252F..%252Ftestsecret/secret.txt", handler);
+		testInvalidPath("%2E%2E%252F%2E%2E%252Ftestsecret/secret.txt", handler);
+		testInvalidPath("test/%252E%252E/%252E%252E/testsecret/secret.txt", handler);
 	}
 
 	private void testInvalidPath(String requestPath, ResourceHttpRequestHandler handler) throws Exception {
@@ -418,6 +425,18 @@ class ResourceHttpRequestHandlerTests {
 			fail(requestPath + " doesn't actually exist as a relative path");
 		}
 		assertThat(this.response.getStatus()).isEqualTo(HttpStatus.NOT_FOUND.value());
+	}
+
+	@Test
+	void resolveEncodedPathNormalizedWithinLocation() throws Exception {
+		Resource location = new UrlResource(getClass().getResource("./test/"));
+		this.handler.setLocations(List.of(location));
+		this.handler.afterPropertiesSet();
+		Resource secretResource = new UrlResource(getClass().getResource("testsecret/secret.txt"));
+		String secretPath = secretResource.getURL().getPath();
+
+		// Normalized to a path under the location, where the secret does not exist
+		testInvalidPath("%2F%2F%2E%2E%2F%2F%2E%2E" + secretPath, this.handler);
 	}
 
 	@Test
