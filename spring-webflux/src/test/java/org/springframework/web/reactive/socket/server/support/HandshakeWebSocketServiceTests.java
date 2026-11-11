@@ -23,16 +23,19 @@ import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.web.reactive.socket.HandshakeInfo;
 import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.server.RequestUpgradeStrategy;
 import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.ServerWebInputException;
 import org.springframework.web.testfixture.http.server.reactive.MockServerHttpRequest;
 import org.springframework.web.testfixture.server.MockServerWebExchange;
 import org.springframework.web.testfixture.server.MockWebSession;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -69,6 +72,49 @@ class HandshakeWebSocketServiceTests {
 				.containsEntry("a1", "v1")
 				.containsEntry("a3", "v3")
 				.containsEntry("a5", "v5");
+	}
+
+	@Test
+	void invalidUpgradeHeaderDoesNotExposeRequestHeaders() {
+		MockServerHttpRequest request = MockServerHttpRequest.get("/")
+				.header("upgrade", "h2c")
+				.header("connection", "upgrade")
+				.header("X-Session-Token", "secret-token-value")
+				.header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				.header("Sec-WebSocket-Version", "13")
+				.build();
+
+		assertBadRequestWithoutHeaders(request, "Can \"Upgrade\" only to \"WebSocket\".");
+	}
+
+	@Test
+	void invalidConnectionHeaderDoesNotExposeRequestHeaders() {
+		MockServerHttpRequest request = MockServerHttpRequest.get("/")
+				.header("upgrade", "websocket")
+				.header("connection", "keep-alive")
+				.header("X-Session-Token", "secret-token-value")
+				.header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				.header("Sec-WebSocket-Version", "13")
+				.build();
+
+		assertBadRequestWithoutHeaders(request, "\"Connection\" must be \"upgrade\".");
+	}
+
+	private void assertBadRequestWithoutHeaders(MockServerHttpRequest request, String expectedReason) {
+		MockServerWebExchange exchange = MockServerWebExchange.from(request);
+		TestRequestUpgradeStrategy upgradeStrategy = new TestRequestUpgradeStrategy();
+		HandshakeWebSocketService service = new HandshakeWebSocketService(upgradeStrategy);
+
+		assertThatExceptionOfType(ServerWebInputException.class)
+				.isThrownBy(() -> service.handleRequest(exchange, mock()).block())
+				.satisfies(ex -> {
+					assertThat(ex.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+					assertThat(ex.getReason()).isEqualTo(expectedReason);
+					assertThat(ex.getReason()).doesNotContain("X-Session-Token", "secret-token-value");
+					assertThat(ex.getMessage()).doesNotContain("X-Session-Token", "secret-token-value");
+				});
+
+		assertThat(upgradeStrategy.handshakeInfo).isNull();
 	}
 
 	private MockServerHttpRequest initHandshakeRequest() {
